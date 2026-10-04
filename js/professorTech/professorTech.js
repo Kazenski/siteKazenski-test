@@ -8,11 +8,16 @@ let state = {
     filters: { school: '', classId: '', disciplineId: '', quarter: '1' },
     cache: { students: [], disciplinesMap: new Map() },
     chamada: { registros: {}, obs: "", lancado: null },
-    notasCache: {}
+    notasCache: {},
+    sorteioIndividual: { pool: [], sorteados: [], winner: null },
+    sorteioGrupos: { lastGroups: [] },
+    evolucaoAluno: { alunoId: null, alunoNome: null, trimestre: '1', dados: null, chartFaltas: null, chartNotas: null }
 };
 let els = {};
 let anotacoesCache = [];
 let apoiaCache = [];
+// uid -> análise de absenteísmo (usada para sinalizar risco de evasão no APOIA)
+let apoiaAlertasCache = {};
 let sortedGroupsCache = [];
 let cadastroSucessos = [];
 let recadastroCache = [];
@@ -106,7 +111,13 @@ export async function renderProfessorTab() {
 
     addSafeListener('apoia', () => window.profAPI.loadApoiaRegistros());
     addSafeListener('sorteios', () => window.profAPI.initSorteiosTab());
+    if (els.btnResetSorteio) els.btnResetSorteio.onclick = () => window.profAPI.resetSorteioIndividual();
     addSafeListener('analise', () => window.profAPI.populateAnaliseStudentSelect());
+    addSafeListener('evolucao', () => window.profAPI.initEvolucaoTab());
+    if (els.evolBtn) els.evolBtn.onclick = () => window.profAPI.loadEvolucaoAluno();
+    if (els.evolBtnFaltas) els.evolBtnFaltas.onclick = () => window.profAPI.renderEvolucaoFaltas();
+    if (els.evolBtnPeriodo) els.evolBtnPeriodo.onclick = () => window.profAPI.resetEvolucaoPeriodo();
+    if (els.evolTrimestre) els.evolTrimestre.onchange = () => window.profAPI.loadEvolucaoAluno();
     addSafeListener('aplicar-aval', () => window.profAPI.renderAplicarAvalTable());
     addSafeListener('analise-geral', () => window.profAPI.loadGeralDashboard());
     addSafeListener('avaliacoes', () => window.profAPI.loadAvaliacoesAdmin());
@@ -178,7 +189,9 @@ function mapearDOM() {
         relEnd: document.getElementById('rel-end'),
         btnGenReport: document.getElementById('btn-gen-report'),
         relResults: document.getElementById('rel-results'),
+        relOverview: document.getElementById('rel-overview'),
         relSummary: document.getElementById('rel-summary-body'),
+        relAlertas: document.getElementById('rel-alertas-body'),
         relDetailed: document.getElementById('rel-detailed-body'),
         relTotal: document.getElementById('rel-total'),
 
@@ -247,6 +260,7 @@ function mapearDOM() {
         viewSorteioGrupos: document.getElementById('view-sorteio-grupos'),
         rouletteDisplay: document.getElementById('roulette-display'),
         btnSpinIndiv: document.getElementById('btn-spin-indiv'),
+        btnResetSorteio: document.getElementById('btn-reset-sorteio'),
         btnSpinGrupos: document.getElementById('btn-spin-grupos'),
         groupSizeInput: document.getElementById('group-size'),
         btnExportTxt: document.getElementById('btn-export-txt'),
@@ -280,6 +294,20 @@ function mapearDOM() {
         msgEvolution: document.getElementById('chart-evolution-msg'),
         selEvolutionDisc: document.getElementById('chart-evolution-disc'),
         predictiveList: document.getElementById('predictive-list'),
+
+        // Evolução do Aluno
+        evolAluno: document.getElementById('evol-aluno'),
+        evolTrimestre: document.getElementById('evol-trimestre'),
+        evolBtn: document.getElementById('evol-btn'),
+        evolBtnFaltas: document.getElementById('evol-btn-faltas'),
+        evolBtnPeriodo: document.getElementById('evol-btn-periodo'),
+        evolStart: document.getElementById('evol-start'),
+        evolEnd: document.getElementById('evol-end'),
+        evolMsg: document.getElementById('evol-msg'),
+        evolDashboard: document.getElementById('evol-dashboard'),
+        evolKpis: document.getElementById('evol-kpis'),
+        evolAlertas: document.getElementById('evol-alertas'),
+        evolTabelaNotas: document.getElementById('evol-tabela-notas'),
 
         // Análise Geral (Turma)
         geralDashboard: document.getElementById('geral-dashboard'),
@@ -732,6 +760,486 @@ function getNoteColor(v) {
 }
 
 // ==========================================
+// ANÁLISE DE ABSENTEÍSMO
+// ==========================================
+// Regras acordadas para sinalizar risco de evasão:
+//   - 5 ou mais faltas em aulas consecutivas
+//   - 7 ou mais blocos de falta intercalados por presenças (padrão "alternado")
+const REGRAS_AUSENTISMO = { SEQUENCIA: 5, ALTERNADAS: 7 };
+
+/**
+ * Normaliza o status gravado no banco. historicamente o app gravou
+ * 'falta' em alguns registros e 'ausente' em outros.
+ */
+function normalizarStatusPresenca(status) {
+    if (status === undefined || status === null || status === '') return 'sem-registro';
+    const s = String(status).toLowerCase();
+    if (s === 'falta' || s === 'f' || s === 'ausente') return 'ausente';
+    if (s === 'presente' || s === 'p') return 'presente';
+    if (s === 'justificado' || s === 'justificada' || s === 'j') return 'justificado';
+    return s;
+}
+
+/**
+ * Analisa o padrão de faltas de um aluno em uma lista de aulas JÁ ORDENADA por data.
+ * @param {Array<{status: string, data: Date|null}>} aulas
+ */
+function analisarAusentismo(aulas) {
+    let atual = 0;
+    let maxSequencia = 0;
+    let blocos = 0;
+    let emFalta = false;
+    let total = 0;
+    let justificadas = 0;
+    let presencas = 0;
+    let registradas = 0;
+
+    for (const aula of aulas) {
+        const s = normalizarStatusPresenca(aula.status);
+        if (s === 'sem-registro') continue;
+        registradas++;
+        if (s === 'ausente') {
+            total++;
+            atual++;
+            if (atual > maxSequencia) maxSequencia = atual;
+            if (!emFalta) { blocos++; emFalta = true; }
+        } else {
+            if (s === 'justificado') justificadas++;
+            if (s === 'presente') presencas++;
+            atual = 0;
+            emFalta = false;
+        }
+    }
+
+    return {
+        total,
+        justificadas,
+        presencas,
+        registradas,
+        maxSequencia,
+        blocos,
+        pctPresenca: registradas ? (presencas / registradas) * 100 : 0,
+        alertaSequencial: maxSequencia >= REGRAS_AUSENTISMO.SEQUENCIA,
+        alertaAlternado: blocos >= REGRAS_AUSENTISMO.ALTERNADAS,
+        get critico() {
+            return this.alertaSequencial || this.alertaAlternado;
+        }
+    };
+}
+
+/** Badges visuais dos alertas de absenteísmo. */
+function renderAlertasAusentismo(analise) {
+    const partes = [];
+    if (analise.alertaSequencial) {
+        partes.push(`<span class="inline-flex items-center gap-1 bg-red-500/15 text-red-400 border border-red-500/30 px-2 py-0.5 rounded-full text-[10px] font-black uppercase tracking-wide whitespace-nowrap" title="Sequência atual ou máxima de ${analise.maxSequencia} aulas seguidas sem presença"><i class="fas fa-fire"></i> ${analise.maxSequencia} seguidas</span>`);
+    }
+    if (analise.alertaAlternado) {
+        partes.push(`<span class="inline-flex items-center gap-1 bg-orange-500/15 text-orange-400 border border-orange-500/30 px-2 py-0.5 rounded-full text-[10px] font-black uppercase tracking-wide whitespace-nowrap" title="Padrão intercalado: ${analise.blocos} blocos de falta separados por presenças"><i class="fas fa-shuffle"></i> ${analise.blocos} alternadas</span>`);
+    }
+    return partes.join(' ');
+}
+
+function corPctPresenca(pct) {
+    if (pct >= 90) return 'text-green-400';
+    if (pct >= 75) return 'text-amber-400';
+    return 'text-red-400';
+}
+
+/** Estatísticas de um conjunto de notas (0 a 10). */
+function estatisticasNotas(valores) {
+    const vals = valores.filter(v => Number.isFinite(v));
+    const n = vals.length;
+    if (!n) return { n: 0, media: null, desvio: null, min: null, max: null, slope: null, faixa: 'sem-dados' };
+
+    const media = vals.reduce((a, b) => a + b, 0) / n;
+    const desvio = Math.sqrt(vals.reduce((s, v) => s + (v - media) ** 2, 0) / n);
+
+    // Inclinação da reta de tendência (progressão): >0 subindo, <0 caindo
+    let slope = null;
+    if (n >= 2) {
+        const xs = vals.map((_, i) => i);
+        const mx = xs.reduce((a, b) => a + b, 0) / n;
+        const num = vals.reduce((s, v, i) => s + (xs[i] - mx) * (v - media), 0);
+        const den = xs.reduce((s, x) => s + (x - mx) ** 2, 0);
+        slope = den ? num / den : 0;
+    }
+
+    const faixa = desvio >= 2.5 ? 'alta' : desvio >= 1.5 ? 'media' : 'baixa';
+    return { n, media, desvio, min: Math.min(...vals), max: Math.max(...vals), slope, faixa };
+}
+
+/** Data no formato YYYY-MM-DD sem escorregar de fuso horário. */
+function dataParaInput(d) {
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+/**
+ * Resolve o construtor do jsPDF.
+ * O bundle UMD (jspdf.umd.min.js) publica a classe em `window.jspdf.jsPDF`,
+ * e NÃO em `window.jsPDF`. Usar `new jsPDF(...)` direto quebrava a exportação
+ * de PDF com ReferenceError. Aqui tentamos os dois caminhos.
+ */
+function criarJsPDF(opts) {
+    const Ctor = window.jsPDF || (window.jspdf && window.jspdf.jsPDF);
+    if (!Ctor) throw new Error('Biblioteca de PDF (jsPDF) nao carregou. Recarregue a pagina.');
+    return new Ctor(opts);
+}
+
+// ==========================================
+// EVOLUÇÃO DO ALUNO — RENDERIZADORES
+// ==========================================
+
+function corNota(v) {
+    if (v === null || v === undefined) return 'text-slate-600';
+    if (v >= 7) return 'text-emerald-400';
+    if (v >= 6) return 'text-amber-400';
+    return 'text-red-400';
+}
+
+function corNotaBg(v) {
+    if (v === null || v === undefined) return '#334155';
+    if (v >= 7) return '#10b981';
+    if (v >= 6) return '#f59e0b';
+    return '#ef4444';
+}
+
+function mostrarOculto(msgId, visivel, texto) {
+    const el = document.getElementById(msgId);
+    if (!el) return;
+    if (visivel) {
+        if (texto) el.textContent = texto;
+        el.classList.remove('hidden');
+    } else {
+        el.classList.add('hidden');
+    }
+}
+
+function renderEvolucaoKpis(stats, mediasPos, porDisciplina) {
+    const card = (icone, corIcone, valor, corValor, rotulo, sub, id) => `
+        <div class="bg-slate-900/70 border border-slate-700 rounded-xl p-4 shadow">
+            <div class="flex items-center gap-2 mb-2">
+                <i class="fas ${icone} ${corIcone} text-sm"></i>
+                <span class="text-[9px] uppercase tracking-widest text-slate-400 font-bold truncate">${rotulo}</span>
+            </div>
+            <div class="text-3xl font-black leading-none ${corValor}"${id ? ` id="${id}"` : ''}>${valor}</div>
+            <div class="text-[10px] text-slate-500 mt-1 truncate"${id ? ` id="${id}-sub"` : ''}>${sub || ''}</div>
+        </div>`;
+
+    const rotDispersao = { baixa: 'Estável', media: 'Oscilante', alta: 'Irregular' };
+    const corDispersao = { baixa: 'text-emerald-400', media: 'text-amber-400', alta: 'text-orange-400' };
+
+    const prog = mediasPos.valor !== null ? mediasPos.slope : null;
+    const progValor = prog === null ? '—' : (prog > 0 ? '+' : '') + prog.toFixed(2);
+    const progRot = prog === null ? 'sem avaliações repetidas'
+        : prog > 0.15 ? 'Em alta'
+            : prog < -0.15 ? 'Em queda'
+                : 'Estável';
+    const progCor = prog === null ? 'text-slate-500'
+        : prog > 0.15 ? 'text-emerald-400'
+            : prog < -0.15 ? 'text-red-400'
+                : 'text-slate-300';
+
+    const comNota = porDisciplina.filter(d => d.media !== null);
+
+    els.evolKpis.innerHTML = [
+        card('fa-bullseye', 'text-emerald-400', stats.media === null ? '—' : stats.media.toFixed(2), corNota(stats.media),
+            'Média do Trimestre', `${stats.n} avaliação(ões) · ${comNota.length} disciplina(s)`),
+        card('fa-arrow-up', 'text-sky-400', stats.max === null ? '—' : stats.max.toFixed(1), 'text-sky-400',
+            'Maior Nota', 'melhor desempenho'),
+        card('fa-arrow-down', 'text-rose-400', stats.min === null ? '—' : stats.min.toFixed(1), 'text-rose-400',
+            'Menor Nota', 'pior desempenho'),
+        card('fa-arrows-left-right', corDispersao[stats.faixa] || 'text-slate-400',
+            stats.desvio === null ? '—' : stats.desvio.toFixed(2), corDispersao[stats.faixa] || 'text-slate-500',
+            'Dispersão', `${rotDispersao[stats.faixa] || 'sem dados'} · desvio-padrão`),
+        card('fa-chart-line', progCor, progValor, progCor, 'Progressão', `${progRot} · N1→N4`),
+        card('fa-user-check', 'text-blue-400', '-', 'text-slate-500', 'Frequência no Período', 'definir período abaixo', 'evol-kpi-freq')
+    ].join('');
+}
+
+function renderEvolucaoProgressao(medias, stats) {
+    const canvas = document.getElementById('evol-chart-progressao');
+    if (!canvas) return;
+
+    if (chartInstances['evolProgressao']) chartInstances['evolProgressao'].destroy();
+
+    if (medias.every(m => m === null)) {
+        mostrarOculto('evol-chart-progressao-msg', true, 'Sem notas no trimestre.');
+        return;
+    }
+    mostrarOculto('evol-chart-progressao-msg', false);
+
+    // Reta de tendência sobre as médias por posição
+    const pontos = medias.map((m, i) => (m === null ? null : m)).filter(m => m !== null);
+    let tendencia = [null, null, null, null];
+    if (pontos.length >= 2) {
+        const xs = medias.map((m, i) => (m === null ? null : i)).filter(v => v !== null);
+        const n = xs.length;
+        const mx = xs.reduce((a, b) => a + b, 0) / n;
+        const my = pontos.reduce((a, b) => a + b, 0) / n;
+        const den = xs.reduce((s, x) => s + (x - mx) ** 2, 0);
+        const slope = den ? pontos.reduce((s, y, i) => s + (xs[i] - mx) * (y - my), 0) / den : 0;
+        tendencia = [0, 1, 2, 3].map(i => +(my + slope * (i - mx)).toFixed(2));
+    }
+
+    chartInstances['evolProgressao'] = new Chart(canvas.getContext('2d'), {
+        type: 'line',
+        data: {
+            labels: ['N1', 'N2', 'N3', 'N4'],
+            datasets: [
+                {
+                    label: 'Média por avaliação',
+                    data: medias,
+                    borderColor: '#34d399',
+                    backgroundColor: 'rgba(52, 211, 153, 0.15)',
+                    borderWidth: 3,
+                    tension: 0.35,
+                    fill: true,
+                    spanGaps: true,
+                    pointBackgroundColor: medias.map(m => corNotaBg(m)),
+                    pointBorderColor: '#0f172a',
+                    pointBorderWidth: 2,
+                    pointRadius: 7,
+                    pointHoverRadius: 9
+                },
+                {
+                    label: 'Média do trimestre',
+                    data: medias.map(() => stats.media),
+                    borderColor: 'rgba(245, 158, 11, 0.9)',
+                    borderWidth: 1.5,
+                    borderDash: [6, 4],
+                    pointRadius: 0,
+                    fill: false,
+                    spanGaps: true
+                },
+                {
+                    label: 'Tendência',
+                    data: tendencia,
+                    borderColor: 'rgba(148, 163, 184, 0.8)',
+                    borderWidth: 1.5,
+                    borderDash: [3, 3],
+                    pointRadius: 0,
+                    fill: false,
+                    spanGaps: true
+                }
+            ]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            interaction: { mode: 'index', intersect: false },
+            plugins: {
+                legend: { labels: { color: '#cbd5e1', boxWidth: 12, font: { size: 10 } } },
+                tooltip: {
+                    callbacks: {
+                        label: (ctx) => `${ctx.dataset.label}: ${ctx.parsed.y === null ? '—' : ctx.parsed.y.toFixed(2)}`
+                    }
+                }
+            },
+            scales: {
+                y: { min: 0, max: 10, ticks: { color: '#64748b', stepSize: 2 }, grid: { color: '#334155' } },
+                x: { ticks: { color: '#94a3b8', font: { size: 11, weight: 'bold' } }, grid: { display: false } }
+            }
+        }
+    });
+}
+
+function renderEvolucaoDispersao(itens, stats) {
+    const canvas = document.getElementById('evol-chart-dispersao');
+    if (!canvas) return;
+
+    if (chartInstances['evolDispersao']) chartInstances['evolDispersao'].destroy();
+
+    if (itens.length === 0) {
+        mostrarOculto('evol-chart-dispersao-msg', true, 'Sem notas no trimestre.');
+        return;
+    }
+    mostrarOculto('evol-chart-dispersao-msg', false);
+
+    const media = stats.media ?? 0;
+    const desvio = stats.desvio ?? 0;
+    const faixaX = [-0.5, itens.length - 0.5];
+
+    // Linhas horizontais de referência (média e ± 1 desvio)
+    const linha = (label, valor, cor, dash) => ({
+        type: 'line',
+        label,
+        data: [{ x: faixaX[0], y: valor }, { x: faixaX[1], y: valor }],
+        borderColor: cor,
+        borderWidth: 1,
+        borderDash: dash,
+        pointRadius: 0,
+        fill: false
+    });
+
+    chartInstances['evolDispersao'] = new Chart(canvas.getContext('2d'), {
+        type: 'scatter',
+        data: {
+            datasets: [
+                {
+                    label: 'Notas',
+                    data: itens.map((i, idx) => ({
+                        x: idx,
+                        y: i.nota,
+                        _rot: `${i.rotulo} · ${i.disciplina}`,
+                        _nota: i.nota
+                    })),
+                    backgroundColor: itens.map(i => corNotaBg(i.nota)),
+                    borderColor: '#0f172a',
+                    borderWidth: 2,
+                    pointRadius: 7,
+                    pointHoverRadius: 10
+                },
+                linha('Média', media, 'rgba(245, 158, 11, 0.95)', []),
+                linha('+1 desvio', media + desvio, 'rgba(148, 163, 184, 0.55)', [5, 4]),
+                linha('-1 desvio', media - desvio, 'rgba(148, 163, 184, 0.55)', [5, 4])
+            ]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: {
+                legend: { labels: { color: '#cbd5e1', boxWidth: 12, font: { size: 9 }, filter: (i) => i.text === 'Notas' || i.text === 'Média' } },
+                tooltip: {
+                    callbacks: {
+                        label: (ctx) => {
+                            const p = ctx.raw;
+                            if (p && p._rot) return `${p._rot}: ${p._nota.toFixed(2)}`;
+                            return `${ctx.dataset.label}: ${Number(ctx.parsed.y).toFixed(2)}`;
+                        }
+                    }
+                }
+            },
+            scales: {
+                x: {
+                    min: faixaX[0],
+                    max: Math.max(faixaX[1], 0.5),
+                    ticks: { display: false },
+                    grid: { color: '#334155' }
+                },
+                y: { min: 0, max: 10, ticks: { color: '#64748b', stepSize: 2 }, grid: { color: '#334155' } }
+            }
+        }
+    });
+}
+
+function renderEvolucaoDisciplinas(porDisciplina) {
+    const canvas = document.getElementById('evol-chart-disciplinas');
+    if (!canvas) return;
+
+    if (chartInstances['evolDisc']) chartInstances['evolDisc'].destroy();
+
+    const comNota = porDisciplina.filter(d => d.media !== null);
+    if (comNota.length === 0) {
+        mostrarOculto('evol-chart-disciplinas-msg', true, 'Sem notas no trimestre.');
+        return;
+    }
+    mostrarOculto('evol-chart-disciplinas-msg', false);
+
+    const rotuloCurto = d => (d.length > 18 ? d.substring(0, 17) + '…' : d);
+
+    chartInstances['evolDisc'] = new Chart(canvas.getContext('2d'), {
+        type: 'bar',
+        data: {
+            labels: comNota.map(d => rotuloCurto(d.nome)),
+            datasets: [{
+                label: 'Média',
+                data: comNota.map(d => +d.media.toFixed(2)),
+                backgroundColor: comNota.map(d => corNotaBg(d.media)),
+                borderRadius: 4,
+                borderSkipped: false
+            }]
+        },
+        options: {
+            indexAxis: 'y',
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: {
+                legend: { display: false },
+                tooltip: {
+                    callbacks: {
+                        title: (items) => comNota[items[0].dataIndex].nome,
+                        label: (ctx) => `Média: ${ctx.parsed.x.toFixed(2)}`
+                    }
+                }
+            },
+            scales: {
+                x: { min: 0, max: 10, ticks: { color: '#64748b', stepSize: 2 }, grid: { color: '#334155' } },
+                y: { ticks: { color: '#94a3b8', font: { size: 10 } }, grid: { display: false } }
+            }
+        }
+    });
+}
+
+function renderEvolucaoTabela(porDisciplina) {
+    if (porDisciplina.length === 0) {
+        els.evolTabelaNotas.innerHTML = '<tr><td colspan="6" class="p-6 text-center text-slate-500 italic">Nenhuma nota registrada neste trimestre.</td></tr>';
+        return;
+    }
+
+    els.evolTabelaNotas.innerHTML = porDisciplina.map(d => `
+        <tr class="hover:bg-slate-800/60 transition-colors">
+            <td class="p-3 font-bold text-slate-200">${escapeHTML(d.nome)}</td>
+            ${d.brutos.map(b => {
+        const v = (b === null || b === undefined || b === '') ? null : parseFloat(b);
+        return `<td class="p-3 text-center font-bold ${Number.isFinite(v) ? corNota(v) : 'text-slate-700'}">${Number.isFinite(v) ? v.toFixed(1) : '–'}</td>`;
+    }).join('')}
+            <td class="p-3 text-center font-black ${corNota(d.media)}">${d.media === null ? '–' : d.media.toFixed(2)}</td>
+        </tr>
+    `).join('');
+}
+
+/**
+ * Varre os diários da turma/disciplina e devolve, por aluno, a análise de
+ * absenteísmo já considerando o "reset" do APOIA: aulas anteriores ao registro
+ * APOIA mais recente do aluno não contam na contagem.
+ * Regra de alerta: 5+ faltas seguidas OU 7+ faltas alternadas.
+ * @returns {Promise<Object<string, object>>} mapa uid -> análise
+ */
+async function varrerAbsenteismoApoia(classId, disciplineId) {
+    const [apoiaSnap, presSnap] = await Promise.all([
+        getDocs(query(collection(db, "apoiaRegistros"), where("turmaId", "==", classId), where("disciplinaId", "==", disciplineId))),
+        getDocs(query(collection(db, "presencas"), where("turma", "==", classId), orderBy("data_aula_timestamp", "asc")))
+    ]);
+
+    // Data do APOIA mais recente de cada aluno (a partir dela a contagem zera)
+    const lastApoiaPerStudent = {};
+    apoiaSnap.forEach(d => {
+        const data = d.data();
+        const ts = data.criadoEm ? data.criadoEm.toMillis() : 0;
+        if (!lastApoiaPerStudent[data.alunoId] || ts > lastApoiaPerStudent[data.alunoId]) {
+            lastApoiaPerStudent[data.alunoId] = ts;
+        }
+    });
+
+    const aulas = [];
+    presSnap.forEach(d => {
+        const data = d.data();
+        if ((data.disciplineId || data.disciplinaId) !== disciplineId) return;
+        aulas.push({
+            ts: data.data_aula_timestamp ? data.data_aula_timestamp.toMillis() : 0,
+            registros: data.registros || {}
+        });
+    });
+    aulas.sort((a, b) => a.ts - b.ts);
+
+    const uids = new Set();
+    aulas.forEach(a => Object.keys(a.registros).forEach(u => uids.add(u)));
+
+    const resultado = {};
+    uids.forEach(uid => {
+        const corte = lastApoiaPerStudent[uid] || 0;
+        const seq = aulas
+            .filter(a => a.ts > corte)
+            .map(a => ({ status: a.registros[uid], data: null }));
+        const analise = analisarAusentismo(seq);
+        if (analise.registradas === 0) return;
+        resultado[uid] = analise;
+    });
+
+    return resultado;
+}
+
+// ==========================================
 // MÓDULO 3: RELATÓRIO DE FALTAS
 // ==========================================
 async function generateReport() {
@@ -741,92 +1249,152 @@ async function generateReport() {
 
     if (!classId) return alert("Selecione a Turma no topo (menu principal).");
     if (!startStr || !endStr) return alert("Selecione as datas de início e fim.");
+    if (startStr > endStr) return alert("A data de início não pode ser posterior à data de fim.");
 
     els.relResults.classList.remove('hidden');
-    els.relDetailed.innerHTML = '<tr><td colspan="2" class="text-center py-8 text-slate-500"><i class="fas fa-spinner fa-spin mr-2"></i> Calculando métricas...</td></tr>';
+    els.relOverview.innerHTML = '';
     els.relSummary.innerHTML = '';
+    els.relAlertas.innerHTML = '<tr><td colspan="4" class="text-center py-6 text-slate-500"><i class="fas fa-spinner fa-spin mr-2"></i> Calculando métricas...</td></tr>';
+    els.relDetailed.innerHTML = '<tr><td colspan="7" class="text-center py-6 text-slate-500"><i class="fas fa-spinner fa-spin mr-2"></i> Calculando métricas...</td></tr>';
     els.relTotal.textContent = '';
 
     try {
         const start = new Date(startStr + "T00:00:00");
         const end = new Date(endStr + "T23:59:59");
 
-        // Array de filtros do Firebase
-        const constraints = [
+        // IMPORTANTE: não filtramos disciplina no Firestore. O campo pode estar
+        // gravado como "disciplinaId" ou "disciplineId" e a query composta
+        // quebrava por falta de índice. Filtramos em JS (mesma estratégia do PDF).
+        const q = query(
+            collection(db, "presencas"),
             where("turma", "==", classId),
             where("data_aula_timestamp", ">=", Timestamp.fromDate(start)),
             where("data_aula_timestamp", "<=", Timestamp.fromDate(end))
-        ];
-
-        // Se escolheu disciplina, filtra só ela. Se não, traz todas da turma.
-        if (disciplineId) constraints.push(where("disciplinaId", "==", disciplineId));
-
-        const q = query(collection(db, "presencas"), ...constraints);
+        );
         const snap = await getDocs(q);
 
-        const stats = {};
+        // 1. Monta a lista de aulas do período (ordenada por data)
+        const aulas = [];
         const discStats = {};
-        let grandTotal = 0;
-
-        // Processa os dados
-        snap.forEach(doc => {
-            const data = doc.data();
+        snap.forEach(dSnap => {
+            const data = dSnap.data();
             const dId = data.disciplineId || data.disciplinaId;
-
-            // Filtro local da disciplina para evitar bugs do banco
             if (disciplineId && dId !== disciplineId) return;
 
-            Object.entries(data.registros || {}).forEach(([uid, status]) => {
-                let s = status;
-                if (s === 'falta') s = 'ausente';
-
-                if (s === 'ausente') {
-                    stats[uid] = (stats[uid] || 0) + 1;
-                    discStats[dId] = (discStats[dId] || 0) + 1;
-                    grandTotal++;
-                }
-            });
+            const ts = data.data_aula_timestamp;
+            const dateObj = (ts && typeof ts.toDate === 'function') ? ts.toDate() : null;
+            aulas.push({ dId, dateObj, registros: data.registros || {} });
+            discStats[dId] = (discStats[dId] || 0) + 1;
+        });
+        aulas.sort((a, b) => {
+            if (!a.dateObj && !b.dateObj) return 0;
+            if (!a.dateObj) return 1;
+            if (!b.dateObj) return -1;
+            return a.dateObj - b.dateObj;
         });
 
-        // 1. Renderiza Tabela de Resumo
-        let summaryHtml = '';
-        for (const [dId, count] of Object.entries(discStats)) {
+        // 2. Garante a lista de alunos da turma
+        let students = state.cache.students;
+        if (!students.length || state.filters.classId !== classId) {
+            const qS = query(collection(db, "users"), where("turma", "==", classId), where("Aluno", "==", true), orderBy("nome"));
+            const snapS = await getDocs(qS);
+            students = [];
+            snapS.forEach(d => students.push({ id: d.id, nome: d.data().nome }));
+            state.cache.students = students;
+        }
+
+        // 3. Análise de absenteísmo por aluno
+        const linhas = students.map(s => {
+            const seq = aulas.map(a => ({ status: (a.registros || {})[s.id], data: a.dateObj }));
+            const analise = analisarAusentismo(seq);
+            return { id: s.id, nome: s.nome, analise };
+        });
+
+        const comFalta = linhas.filter(l => l.analise.total > 0)
+            .sort((a, b) => b.analise.total - a.analise.total || b.analise.maxSequencia - a.analise.maxSequencia);
+        const emAlerta = comFalta.filter(l => l.analise.critico)
+            .sort((a, b) => b.analise.maxSequencia - a.analise.maxSequencia || b.analise.total - a.analise.total);
+
+        const totalFaltas = linhas.reduce((s, l) => s + l.analise.total, 0);
+        const totalRegistros = linhas.reduce((s, l) => s + l.analise.registradas, 0);
+
+        // 4. Cards de visão geral
+        const card = (icone, cor, valor, rotulo) => `
+            <div class="bg-slate-900/70 border border-slate-700 rounded-xl p-4 flex items-center gap-3">
+                <div class="w-10 h-10 rounded-lg ${cor} flex items-center justify-center shrink-0"><i class="fas ${icone}"></i></div>
+                <div class="min-w-0">
+                    <div class="text-2xl font-black text-white leading-none">${valor}</div>
+                    <div class="text-[10px] uppercase tracking-widest text-slate-400 font-bold mt-1 truncate">${rotulo}</div>
+                </div>
+            </div>`;
+
+        els.relOverview.innerHTML = [
+            card('fa-calendar-alt', 'bg-blue-500/15 text-blue-400', aulas.length, 'Aulas no período'),
+            card('fa-user-minus', 'bg-red-500/15 text-red-500', totalFaltas, 'Total de faltas'),
+            card('fa-percent', 'bg-emerald-500/15 text-emerald-400', totalRegistros ? (100 - (totalFaltas / totalRegistros) * 100).toFixed(1) + '%' : '-', 'Frequência média'),
+            card('fa-triangle-exclamation', emAlerta.length ? 'bg-amber-500/15 text-amber-400' : 'bg-slate-700/40 text-slate-400', emAlerta.length, 'Alunos em alerta')
+        ].join('');
+
+        // 5. Tabela de resumo por disciplina
+        const summaryHtml = Object.entries(discStats).map(([dId, totalAulas]) => {
+            const faltasDisc = linhas.reduce((s, l) => {
+                const naDisc = aulas.filter(a => a.dId === dId && (a.registros || {})[l.id] !== undefined);
+                return s + naDisc.filter(a => normalizarStatusPresenca(a.registros[l.id]) === 'ausente').length;
+            }, 0);
+            const pct = totalAulas ? (faltasDisc / (totalAulas * linhas.length) * 100) : 0;
             const dName = state.cache.disciplinesMap.get(dId) || dId;
-            summaryHtml += `
+            return `
                 <tr class="hover:bg-slate-800/80 transition-colors">
                     <td class="p-4 text-slate-300 font-bold">${escapeHTML(dName)}</td>
-                    <td class="p-4 text-center font-black text-red-500 text-lg">${count}</td>
+                    <td class="p-4 text-center text-slate-400 font-bold">${totalAulas}</td>
+                    <td class="p-4 text-center font-black text-red-500 text-lg">${faltasDisc}</td>
+                    <td class="p-4 text-center font-bold ${pct > 20 ? 'text-red-400' : pct > 10 ? 'text-amber-400' : 'text-green-400'}">${pct.toFixed(1)}%</td>
                 </tr>`;
-        }
-        els.relSummary.innerHTML = summaryHtml || '<tr><td colspan="2" class="text-center p-6 text-slate-500 italic">Nenhuma falta registrada no período.</td></tr>';
-        els.relTotal.textContent = `Total de Faltas no Período: ${grandTotal}`;
+        }).join('');
+        els.relSummary.innerHTML = summaryHtml || '<tr><td colspan="4" class="text-center p-6 text-slate-500 italic">Nenhuma aula registrada no período.</td></tr>';
+        els.relTotal.textContent = `Total de Faltas no Período: ${totalFaltas}`;
 
-        // 2. Renderiza Tabela Detalhada por Aluno
-        els.relDetailed.innerHTML = '';
-        for (const [uid, count] of Object.entries(stats)) {
-            let name = "Aluno Desconhecido";
-            const cached = state.cache.students.find(s => s.id === uid);
-            if (cached) {
-                name = cached.nome;
-            } else {
-                const docSnap = await getDoc(doc(db, "users", uid));
-                if (docSnap.exists()) name = docSnap.data().nome;
-            }
-
-            els.relDetailed.insertAdjacentHTML('beforeend', `
-                <tr class="hover:bg-slate-800/80 transition-colors">
-                    <td class="p-4 font-bold text-slate-200">${escapeHTML(name)}</td>
-                    <td class="p-4 text-center font-black text-red-500 text-lg">${count}</td>
-                </tr>
-            `);
+        // 6. Alertas de absenteísmo (5 seguidas / 7 alternadas)
+        if (emAlerta.length === 0) {
+            els.relAlertas.innerHTML = `<tr><td colspan="4" class="text-center p-6 text-green-400 italic font-bold"><i class="fas fa-check-circle mr-2"></i>Nenhum aluno atingiu ${REGRAS_AUSENTISMO.SEQUENCIA} faltas seguidas ou ${REGRAS_AUSENTISMO.ALTERNADAS} alternadas.</td></tr>`;
+        } else {
+            els.relAlertas.innerHTML = emAlerta.map(l => {
+                const a = l.analise;
+                return `
+                    <tr class="bg-red-500/[0.04] hover:bg-red-500/10 transition-colors border-l-4 border-red-500/60">
+                        <td class="p-4 font-black text-slate-100">${escapeHTML(l.nome)}</td>
+                        <td class="p-4 text-center font-black text-red-500 text-lg">${a.total}</td>
+                        <td class="p-4 text-center font-bold ${corPctPresenca(a.pctPresenca)}">${a.pctPresenca.toFixed(0)}%</td>
+                        <td class="p-4 text-center">${renderAlertasAusentismo(a) || '<span class="text-slate-600 text-xs">-</span>'}</td>
+                    </tr>`;
+            }).join('');
         }
-        if (Object.keys(stats).length === 0) {
-            els.relDetailed.innerHTML = '<tr><td colspan="2" class="text-center p-6 text-slate-500 italic">Turma com 100% de presença neste período!</td></tr>';
+
+        // 7. Tabela detalhada por aluno (apenas quem teve falta)
+        if (comFalta.length === 0) {
+            els.relDetailed.innerHTML = '<tr><td colspan="7" class="text-center p-6 text-slate-500 italic">Turma com 100% de presença neste período!</td></tr>';
+        } else {
+            els.relDetailed.innerHTML = comFalta.map(l => {
+                const a = l.analise;
+                return `
+                    <tr class="hover:bg-slate-800/80 transition-colors ${a.critico ? 'bg-red-500/[0.04]' : ''}">
+                        <td class="p-4 font-bold text-slate-200">${escapeHTML(l.nome)}</td>
+                        <td class="p-4 text-center font-black text-red-500 text-lg">${a.total}</td>
+                        <td class="p-4 text-center text-slate-400 font-bold">${a.registradas}</td>
+                        <td class="p-4 text-center font-bold ${corPctPresenca(a.pctPresenca)}">${a.pctPresenca.toFixed(0)}%</td>
+                        <td class="p-4 text-center font-bold ${a.alertaSequencial ? 'text-red-400' : 'text-slate-400'}">${a.maxSequencia}</td>
+                        <td class="p-4 text-center font-bold ${a.alertaAlternado ? 'text-orange-400' : 'text-slate-400'}">${a.blocos}</td>
+                        <td class="p-4 text-center">${renderAlertasAusentismo(a) || '<span class="text-slate-700 text-xs">—</span>'}</td>
+                    </tr>`;
+            }).join('');
         }
 
     } catch (e) {
+        console.error(e);
         alert("Erro ao gerar relatório: " + e.message);
-        els.relDetailed.innerHTML = `<tr><td colspan="2" class="text-center p-6 text-red-500 font-bold">Falha na consulta.</td></tr>`;
+        els.relOverview.innerHTML = '';
+        els.relAlertas.innerHTML = '';
+        els.relDetailed.innerHTML = '<tr><td colspan="7" class="text-center p-6 text-red-500 font-bold">Falha na consulta: ' + escapeHTML(e.message) + '</td></tr>';
     }
 }
 
@@ -870,57 +1438,169 @@ async function generatePdf() {
         const snapP = await getDocs(qP);
 
         // Filtra as aulas da disciplina correta e monta as colunas (cobre ambos os nomes de variável)
-        const cols = [];
-        snapP.forEach(doc => {
-            const d = doc.data();
+        const aulasDisc = [];
+        snapP.forEach(dSnap => {
+            const d = dSnap.data();
             if (d.disciplineId === disciplineId || d.disciplinaId === disciplineId) {
-                const dateObj = d.data_aula_timestamp.toDate();
-                const label = `${String(dateObj.getDate()).padStart(2, '0')}/${String(dateObj.getMonth() + 1).padStart(2, '0')}`;
-                cols.push({ label, regs: d.registros || {} });
+                const ts = d.data_aula_timestamp;
+                aulasDisc.push({ dateObj: ts.toDate(), regs: d.registros || {} });
             }
         });
+        aulasDisc.sort((a, b) => a.dateObj - b.dateObj);
+
+        const cols = aulasDisc.map(a => ({
+            label: `${String(a.dateObj.getDate()).padStart(2, '0')}/${String(a.dateObj.getMonth() + 1).padStart(2, '0')}`,
+            regs: a.regs
+        }));
 
         if (cols.length === 0) throw new Error("Sem aulas registradas neste período para exportar.");
 
-        // 4. Monta as Linhas (Alunos e as Faltas)
-        const body = students.map(s => {
-            const row = [s.nome];
-            let totalFaltas = 0;
-
-            cols.forEach(col => {
-                const stat = col.regs[s.id];
-                let mark = '-';
-                if (stat === 'presente') mark = 'P';
-                else if (stat === 'ausente') { mark = 'F'; totalFaltas++; }
-                else if (stat === 'justificado') mark = 'J';
-                row.push(mark);
+        // 4. Monta as Linhas (Alunos x Aulas) já normalizando 'falta' -> 'F'
+        const rows = students.map(s => {
+            const seq = cols.map(c => ({ status: c.regs[s.id], data: null }));
+            const analise = analisarAusentismo(seq);
+            const cells = cols.map(c => {
+                const st = normalizarStatusPresenca(c.regs[s.id]);
+                if (st === 'ausente') return 'F';
+                if (st === 'presente') return 'P';
+                if (st === 'justificado') return 'J';
+                return '·';
             });
-            row.push(String(totalFaltas));
-            return row;
+            return { nome: s.nome, cells, analise };
         });
+
+        const totalFaltas = rows.reduce((s, r) => s + r.analise.total, 0);
+        const emAlerta = rows.filter(r => r.analise.critico);
 
         // 5. Instancia o PDF e Desenha a Tabela
-        const pdf = new jsPDF('landscape');
+        const pdf = criarJsPDF({ orientation: 'landscape', unit: 'pt', format: 'a4' });
         const dName = state.cache.disciplinesMap.get(disciplineId) || disciplineId;
+        const pageW = pdf.internal.pageSize.getWidth();
+        const pageH = pdf.internal.pageSize.getHeight();
+        const M = 34; // margem lateral
 
-        pdf.setFontSize(14);
-        pdf.text("Diario Oficial - Matriz de Frequência", 14, 15);
-        pdf.setFontSize(10);
-        pdf.text(`Escola: ${school} | Turma: ${classId} | Disciplina: ${dName}`, 14, 22);
+        // ---- Cabeçalho (faixa escura) ----
+        pdf.setFillColor(15, 23, 42);           // slate-900
+        pdf.rect(0, 0, pageW, 74, 'F');
+        pdf.setFillColor(245, 158, 11);         // amber-500
+        pdf.rect(0, 74, pageW, 3, 'F');
 
-        pdf.autoTable({
-            startY: 30,
-            head: [['Aluno', ...cols.map(c => c.label), 'Total Faltas']],
-            body: body,
-            styles: { fontSize: 8, halign: 'center' },
-            columnStyles: { 0: { halign: 'left', fontStyle: 'bold' } },
-            theme: 'grid',
-            headStyles: { fillColor: [59, 130, 246] } // Azul padrão para combinar com o layout
+        pdf.setTextColor(245, 158, 11);
+        pdf.setFont('helvetica', 'bold');
+        pdf.setFontSize(16);
+        pdf.text('DIÁRIO DE CLASSE · MATRIZ DE FREQUÊNCIA', M, 30);
+
+        pdf.setTextColor(203, 213, 225);
+        pdf.setFont('helvetica', 'normal');
+        pdf.setFontSize(9);
+        pdf.text(`Escola: ${school || '-'}   |   Turma: ${classId}   |   Disciplina: ${dName}`, M, 47);
+        pdf.text(`Período: ${startStr} até ${endStr}   |   Aulas: ${cols.length}   |   Total de faltas: ${totalFaltas}   |   Alunos em alerta: ${emAlerta.length}`, M, 62);
+
+        // ---- Legenda ----
+        let lx = M;
+        const ly = 92;
+        const legenda = [
+            ['P', 'Presente', [22, 163, 74]],
+            ['F', 'Falta', [220, 38, 38]],
+            ['J', 'Justificado', [37, 99, 235]],
+            ['·', 'Sem registro', [148, 163, 184]]
+        ];
+        pdf.setFontSize(8);
+        legenda.forEach(([sig, txt, cor]) => {
+            pdf.setFillColor(...cor);
+            pdf.roundedRect(lx, ly - 8, 12, 12, 2, 2, 'F');
+            pdf.setTextColor(...cor);
+            pdf.setFont('helvetica', 'bold');
+            pdf.text(sig, lx + 6, ly + 1, { align: 'center' });
+            pdf.setTextColor(100, 116, 139);
+            pdf.setFont('helvetica', 'normal');
+            pdf.text(txt, lx + 17, ly + 1);
+            lx += pdf.getTextWidth(txt) + 34;
         });
 
-        pdf.save(`Matriz_Frequencia_${classId}_${dName.substring(0, 10)}.pdf`);
+        pdf.setTextColor(100, 116, 139);
+        pdf.setFontSize(7.5);
+        pdf.text('Alerta: 5+ faltas seguidas  |  7+ faltas alternadas', pageW - M, ly + 1, { align: 'right' });
 
-        els.pdfMsg.innerHTML = '<i class="fas fa-check-circle mr-2"></i> PDF Baixado com Sucesso!';
+        const head = [['Aluno', ...cols.map(c => c.label), 'Faltas', 'Seq.', 'Alt.', 'Sinal']];
+        const body = rows.map(r => [
+            r.nome,
+            ...r.cells,
+            String(r.analise.total),
+            String(r.analise.maxSequencia),
+            String(r.analise.blocos),
+            r.analise.critico ? '!' : ''
+        ]);
+
+        const primeiraColAulas = 1;
+        const ultimaColAulas = cols.length;
+
+        pdf.autoTable({
+            startY: 104,
+            margin: { left: M, right: M, top: 92, bottom: 44 },
+            head: head,
+            body: body,
+            theme: 'grid',
+            styles: { font: 'helvetica', fontSize: 7, halign: 'center', cellPadding: 3, lineColor: [226, 232, 240], lineWidth: 0.5 },
+            headStyles: {
+                fillColor: [30, 41, 59], textColor: [248, 250, 252],
+                fontStyle: 'bold', fontSize: 7, halign: 'center',
+                lineColor: [71, 85, 105], lineWidth: 0.5
+            },
+            alternateRowStyles: { fillColor: [248, 250, 252] },
+            columnStyles: {
+                0: { halign: 'left', fontStyle: 'bold', cellWidth: 108, textColor: [30, 41, 59] },
+                [ultimaColAulas + 1]: { halign: 'center', fontStyle: 'bold', cellWidth: 30, textColor: [220, 38, 38], fillColor: [254, 242, 242] },
+                [ultimaColAulas + 2]: { halign: 'center', fontStyle: 'bold', cellWidth: 24 },
+                [ultimaColAulas + 3]: { halign: 'center', fontStyle: 'bold', cellWidth: 24 },
+                [ultimaColAulas + 4]: { halign: 'center', fontStyle: 'bold', cellWidth: 26 }
+            },
+            didParseCell: (data) => {
+                if (data.section !== 'body') return;
+                const col = data.column.index;
+                const txt = String(data.cell.raw);
+
+                // Células P / F / J / · com cor por status
+                if (col >= primeiraColAulas && col <= ultimaColAulas) {
+                    if (txt === 'P') { data.cell.styles.textColor = [22, 163, 74]; data.cell.styles.fontStyle = 'bold'; }
+                    else if (txt === 'F') { data.cell.styles.textColor = [220, 38, 38]; data.cell.styles.fontStyle = 'bold'; data.cell.styles.fillColor = [254, 226, 226]; }
+                    else if (txt === 'J') { data.cell.styles.textColor = [37, 99, 235]; data.cell.styles.fontStyle = 'bold'; }
+                    else { data.cell.styles.textColor = [203, 213, 225]; }
+                }
+
+                // Destaque de linha em alerta de absenteísmo
+                if (txt === '!') {
+                    data.cell.styles.textColor = [255, 255, 255];
+                    data.cell.styles.fillColor = [220, 38, 38];
+                    data.cell.styles.fontSize = 11;
+                }
+                if (col === 0 && data.row.raw[ultimaColAulas + 4] === '!') {
+                    data.cell.styles.fillColor = [254, 242, 242];
+                    data.cell.styles.textColor = [185, 28, 28];
+                }
+                // Sequência / alternadas em alerta
+                if ((col === ultimaColAulas + 2 && Number(txt) >= REGRAS_AUSENTISMO.SEQUENCIA) ||
+                    (col === ultimaColAulas + 3 && Number(txt) >= REGRAS_AUSENTISMO.ALTERNADAS)) {
+                    data.cell.styles.textColor = [220, 38, 38];
+                }
+            },
+            didDrawPage: () => {
+                const p = pdf.internal.getNumberOfPages();
+                pdf.setDrawColor(226, 232, 240);
+                pdf.setLineWidth(0.5);
+                pdf.line(M, pageH - 34, pageW - M, pageH - 34);
+                pdf.setFont('helvetica', 'normal');
+                pdf.setFontSize(7.5);
+                pdf.setTextColor(148, 163, 184);
+                pdf.text(`Kazenski · ${school || ''} · ${classId} · ${dName}`, M, pageH - 20);
+                pdf.text(`Página ${p} de ${pdf.internal.getNumberOfPages()}`, pageW - M, pageH - 20, { align: 'right' });
+            }
+        });
+
+        const nomeArquivo = `Matriz_Frequencia_${classId}_${(dName || '').replace(/[^\w-]+/g, '').substring(0, 12)}_${startStr}_${endStr}.pdf`;
+        pdf.save(nomeArquivo);
+
+        els.pdfMsg.innerHTML = `<i class="fas fa-check-circle mr-2"></i> PDF baixado! ${emAlerta.length ? `<span class="text-amber-400">${emAlerta.length} aluno(s) com alerta de absenteísmo.</span>` : 'Nenhum aluno em alerta.'}`;
         els.pdfMsg.classList.replace('text-blue-400', 'text-green-400');
 
     } catch (e) {
@@ -1519,7 +2199,7 @@ window.profAPI = {
     // MÓDULO: SISTEMA APOIA (EVASÃO E FREQUÊNCIA)
     // ==========================================
     loadApoiaRegistros: async () => {
-        const { classId } = state.filters;
+        const { classId, disciplineId } = state.filters;
         if (!classId) {
             els.apoiaList.innerHTML = '';
             els.apoiaMsg.textContent = "Selecione uma Turma e Disciplina no topo (Carregar).";
@@ -1546,6 +2226,17 @@ window.profAPI = {
                 return tB - tA;
             });
 
+            // Em paralelo: varre os diários para sinalizar risco de evasão.
+            // Falha aqui não pode impedir a listagem dos documentos.
+            apoiaAlertasCache = {};
+            if (disciplineId) {
+                try {
+                    apoiaAlertasCache = await varrerAbsenteismoApoia(classId, disciplineId);
+                } catch (e2) {
+                    console.warn("Não foi possível calcular os alertas de absenteísmo:", e2);
+                }
+            }
+
             window.profAPI.renderApoiaList();
 
         } catch (e) {
@@ -1567,18 +2258,30 @@ window.profAPI = {
             const dataStr = reg.criadoEm ? reg.criadoEm.toDate().toLocaleDateString('pt-BR') : '-';
             const isCoord = reg.status === 'enviado_coordenacao';
 
+            // Sinalização de risco de evasão para o aluno deste documento
+            const analise = apoiaAlertasCache[reg.alunoId];
+            let riscoHtml = '';
+            if (analise && analise.critico) {
+                riscoHtml = `<div class="mt-2 flex flex-wrap gap-1">${renderAlertasAusentismo(analise)}
+                    <span class="inline-flex items-center gap-1 bg-slate-700/60 text-slate-300 border border-slate-600 px-2 py-0.5 rounded-full text-[10px] font-black uppercase tracking-wide" title="Total de faltas após o último APOIA registrado"><i class="fas fa-user-minus"></i> ${analise.total} faltas</span>
+                </div>`;
+            } else if (analise && analise.total > 0) {
+                riscoHtml = `<div class="mt-2"><span class="inline-flex items-center gap-1 bg-slate-700/40 text-slate-400 border border-slate-700 px-2 py-0.5 rounded-full text-[10px] font-black uppercase tracking-wide" title="Faltas após o último APOIA registrado, ainda dentro do limite"><i class="fas fa-user-minus"></i> ${analise.total} faltas · máx. ${analise.maxSequencia} seguidas</span></div>`;
+            }
+
             const badgeClass = isCoord ? 'bg-blue-500/20 text-blue-400 border-blue-500/30' : 'bg-slate-700 text-slate-300 border-slate-600';
             const badgeLabel = isCoord ? '<i class="fas fa-building mr-1"></i> COORDENAÇÃO' : '<i class="fas fa-chalkboard-teacher mr-1"></i> PROFESSOR';
 
             const regSafe = JSON.stringify(reg).replace(/"/g, '&quot;').replace(/'/g, "&#39;");
 
             els.apoiaList.insertAdjacentHTML('beforeend', `
-                <div class="flex flex-col md:flex-row items-start md:items-center justify-between p-4 bg-slate-800/80 border border-slate-700 rounded-xl hover:bg-slate-800 transition-colors gap-4">
-                    <div>
+                <div class="flex flex-col md:flex-row items-start md:items-center justify-between p-4 ${analise && analise.critico ? 'bg-red-950/40 border-red-500/30' : 'bg-slate-800/80 border-slate-700'} border rounded-xl hover:bg-slate-800 transition-colors gap-4">
+                    <div class="min-w-0">
                         <div class="font-bold text-slate-200 text-sm mb-1">${escapeHTML(reg.alunoNome)}</div>
                         <div class="text-[10px] text-slate-400 uppercase tracking-widest font-bold">
-                            ${reg.disciplinaNome} <span class="mx-1">|</span> ${reg.trimestre}º Trimestre <span class="mx-1">|</span> ${dataStr}
+                            ${escapeHTML(reg.disciplinaNome || '')} <span class="mx-1">|</span> ${escapeHTML(String(reg.trimestre ?? ''))}º Trimestre <span class="mx-1">|</span> ${dataStr}
                         </div>
+                        ${riscoHtml}
                     </div>
                     <div class="flex items-center gap-3 w-full md:w-auto">
                         <span class="px-3 py-1 rounded text-[9px] font-black uppercase tracking-widest border ${badgeClass}">${badgeLabel}</span>
@@ -1704,103 +2407,47 @@ window.profAPI = {
         const { classId, disciplineId } = state.filters;
         if (!classId || !disciplineId) return alert("Selecione Turma e Disciplina no topo.");
 
-        els.apoiaFreqBody.innerHTML = '<tr><td colspan="3" class="text-center py-6 text-red-400"><i class="fas fa-spinner fa-spin mr-2"></i> Varrendo diários...</td></tr>';
+        els.apoiaFreqBody.innerHTML = '<tr><td colspan="5" class="text-center py-6 text-red-400"><i class="fas fa-spinner fa-spin mr-2"></i> Varrendo diários...</td></tr>';
         els.apoiaFreqBox.classList.remove('hidden');
 
         try {
-            // --- LÓGICA DE RESET DO APOIA ---
-            // 1. Busca os Registros APOIA já existentes para saber quando "resetar" a contagem
-            const apoiaQ = query(collection(db, "apoiaRegistros"), where("turmaId", "==", classId), where("disciplinaId", "==", disciplineId));
-            const apoiaSnap = await getDocs(apoiaQ);
-            const lastApoiaPerStudent = {};
-
-            apoiaSnap.forEach(doc => {
-                const data = doc.data();
-                const timestamp = data.criadoEm ? data.criadoEm.toMillis() : 0;
-                // Guarda apenas a data do APOIA mais recente do aluno
-                if (!lastApoiaPerStudent[data.alunoId] || timestamp > lastApoiaPerStudent[data.alunoId]) {
-                    lastApoiaPerStudent[data.alunoId] = timestamp;
-                }
-            });
-
-            // 2. Busca Presenças
-            const q = query(collection(db, "presencas"), where("turma", "==", classId), orderBy("data_aula_timestamp", "asc"));
-            const snap = await getDocs(q);
-
-            const faltasAluno = {};
-
-            snap.forEach(doc => {
-                const data = doc.data();
-                const dId = data.disciplineId || data.disciplinaId;
-                if (dId !== disciplineId) return; // Garante a disciplina certa
-
-                const aulaTime = data.data_aula_timestamp ? data.data_aula_timestamp.toMillis() : 0;
-                const regs = data.registros || {};
-
-                // Reseta a contagem de consecutivas se o aluno veio na aula
-                for (const uid in faltasAluno) {
-                    let s = regs[uid];
-                    if (s === 'falta') s = 'ausente';
-                    if (s !== 'ausente') faltasAluno[uid].consecutivas = 0;
-                }
-
-                for (const [uid, status] of Object.entries(regs)) {
-                    let s = status;
-                    if (s === 'falta') s = 'ausente';
-
-                    // Se a aula ocorreu ANTES ou NO MESMO DIA do último APOIA, ignora! (Reset)
-                    if (lastApoiaPerStudent[uid] && aulaTime <= lastApoiaPerStudent[uid]) {
-                        continue;
-                    }
-
-                    if (!faltasAluno[uid]) faltasAluno[uid] = { total: 0, consecutivas: 0, maxConsecutivas: 0 };
-
-                    if (s === 'ausente') {
-                        faltasAluno[uid].total++;
-                        faltasAluno[uid].consecutivas++;
-                        if (faltasAluno[uid].consecutivas > faltasAluno[uid].maxConsecutivas) {
-                            faltasAluno[uid].maxConsecutivas = faltasAluno[uid].consecutivas;
-                        }
-                    }
-                }
-            });
+            apoiaAlertasCache = await varrerAbsenteismoApoia(classId, disciplineId);
 
             els.apoiaFreqBody.innerHTML = '';
             let count = 0;
 
-            for (const [uid, dados] of Object.entries(faltasAluno)) {
-                // A Regra de Ouro do APOIA (7 faltas totais ou 5 consecutivas)
-                if (dados.total >= 7 || dados.maxConsecutivas >= 5) {
+            for (const [uid, a] of Object.entries(apoiaAlertasCache)) {
+                if (!a.critico) continue;
 
-                    let name = "Aluno Desconhecido";
-                    const cached = state.cache.students.find(s => s.id === uid);
-                    if (cached) name = cached.nome;
-                    else {
-                        try {
-                            const uSnap = await getDoc(doc(db, "users", uid));
-                            if (uSnap.exists()) name = uSnap.data().nome;
-                        } catch (e) { }
-                    }
-
-                    let sit = [];
-                    if (dados.total >= 7) sit.push("7+ Faltas (Total)");
-                    if (dados.maxConsecutivas >= 5) sit.push("5+ Seguidas (Evasão)");
-
-                    els.apoiaFreqBody.insertAdjacentHTML('beforeend', `
-                        <tr class="bg-red-950/30 hover:bg-red-900/50 transition-colors">
-                            <td class="p-4 font-bold text-slate-200">${escapeHTML(name)}</td>
-                            <td class="p-4 text-center font-black text-red-500 text-lg">${dados.total}</td>
-                            <td class="p-4 text-center"><span class="bg-red-600 text-white px-2 py-1 rounded text-[9px] font-black uppercase tracking-widest">${sit.join(" | ")}</span></td>
-                        </tr>
-                    `);
-                    count++;
+                let name = "Aluno Desconhecido";
+                const cached = state.cache.students.find(s => s.id === uid);
+                if (cached) name = cached.nome;
+                else {
+                    try {
+                        const uSnap = await getDoc(doc(db, "users", uid));
+                        if (uSnap.exists()) name = uSnap.data().nome;
+                    } catch (e) { }
                 }
+
+                els.apoiaFreqBody.insertAdjacentHTML('beforeend', `
+                    <tr class="bg-red-950/30 hover:bg-red-900/50 transition-colors">
+                        <td class="p-4 font-bold text-slate-200">${escapeHTML(name)}</td>
+                        <td class="p-4 text-center font-black text-red-500 text-lg">${a.total}</td>
+                        <td class="p-4 text-center font-bold ${a.alertaSequencial ? 'text-red-400' : 'text-slate-400'}">${a.maxSequencia}</td>
+                        <td class="p-4 text-center font-bold ${a.alertaAlternado ? 'text-orange-400' : 'text-slate-400'}">${a.blocos}</td>
+                        <td class="p-4 text-center">${renderAlertasAusentismo(a)}</td>
+                    </tr>
+                `);
+                count++;
             }
-            if (count === 0) els.apoiaFreqBody.innerHTML = '<tr><td colspan="3" class="text-center p-6 text-green-500 font-bold"><i class="fas fa-check-circle mr-2"></i> Nenhum aluno atingiu o limite crítico (7 faltas) nesta disciplina.</td></tr>';
+
+            if (count === 0) {
+                els.apoiaFreqBody.innerHTML = `<tr><td colspan="5" class="text-center p-6 text-green-500 font-bold"><i class="fas fa-check-circle mr-2"></i> Nenhum aluno atingiu ${REGRAS_AUSENTISMO.SEQUENCIA} faltas seguidas ou ${REGRAS_AUSENTISMO.ALTERNADAS} alternadas nesta disciplina.</td></tr>`;
+            }
 
         } catch (e) {
             console.error(e);
-            els.apoiaFreqBody.innerHTML = `<tr><td colspan="3" class="text-center p-6 text-red-500 font-bold">Erro na varredura: ${e.message}</td></tr>`;
+            els.apoiaFreqBody.innerHTML = `<tr><td colspan="5" class="text-center p-6 text-red-500 font-bold">Erro na varredura: ${escapeHTML(e.message)}</td></tr>`;
         }
     },
 
@@ -1885,10 +2532,31 @@ window.profAPI = {
 
         if (!hasStudents) {
             els.rouletteDisplay.innerHTML = '<span class="text-2xl opacity-50 text-red-400">Sem Alunos. Carregue a turma.</span>';
-        } else if (els.rouletteDisplay.classList.contains('roulette-winner')) {
-            // Se já tiver rolado sorteio antes, reseta a tela
-            els.rouletteDisplay.innerHTML = '<span class="text-2xl opacity-50">Pronto para sortear</span>';
-            els.rouletteDisplay.classList.remove('roulette-winner');
+            if (els.btnResetSorteio) els.btnResetSorteio.classList.add('hidden');
+            state.sorteioIndividual.pool = [];
+            state.sorteioIndividual.sorteados = [];
+            state.sorteioIndividual.winner = null;
+        } else {
+            if (els.rouletteDisplay.classList.contains('roulette-winner') || state.sorteioIndividual.winner) {
+                els.rouletteDisplay.textContent = state.sorteioIndividual.winner ? state.sorteioIndividual.winner.nome : 'Pronto para sortear';
+                els.rouletteDisplay.classList.add('roulette-winner');
+            } else {
+                els.rouletteDisplay.innerHTML = '<span class="text-2xl opacity-50">Pronto para sortear</span>';
+                els.rouletteDisplay.classList.remove('roulette-winner');
+            }
+            if (!state.sorteioIndividual.pool.length || state.sorteioIndividual.pool.length !== count - state.sorteioIndividual.sorteados.length) {
+                // reset pool when loading new set
+                state.sorteioIndividual.pool = state.cache.students.map(s => ({ id: s.id, nome: s.nome }));
+                state.sorteioIndividual.sorteados = [];
+                state.sorteioIndividual.winner = null;
+                if (els.rouletteDisplay.classList.contains('roulette-winner')) {
+                    els.rouletteDisplay.classList.remove('roulette-winner');
+                    els.rouletteDisplay.innerHTML = '<span class="text-2xl opacity-50">Pronto para sortear</span>';
+                }
+            }
+            if (els.btnResetSorteio) {
+                els.btnResetSorteio.classList.toggle('hidden', state.sorteioIndividual.sorteados.length === 0 && !state.sorteioIndividual.winner);
+            }
         }
     },
 
@@ -1913,6 +2581,18 @@ window.profAPI = {
         const students = state.cache.students;
         if (students.length === 0) return;
 
+        if (!state.sorteioIndividual.pool.length) {
+            state.sorteioIndividual.pool = students.map(s => ({ id: s.id, nome: s.nome }));
+            state.sorteioIndividual.sorteados = [];
+            state.sorteioIndividual.winner = null;
+        }
+
+        if (state.sorteioIndividual.pool.length === 0) {
+            alert('Todos os alunos já foram sorteados! Clique em Resetar Sorteio para recomeçar.');
+            if (els.btnResetSorteio) els.btnResetSorteio.classList.remove('hidden');
+            return;
+        }
+
         els.btnSpinIndiv.disabled = true;
         els.rouletteDisplay.classList.remove('roulette-winner');
 
@@ -1922,8 +2602,8 @@ window.profAPI = {
 
         const interval = setInterval(() => {
             // Sorteia um nome rapidamente para a animação
-            const randomIdx = Math.floor(Math.random() * students.length);
-            els.rouletteDisplay.textContent = students[randomIdx].nome;
+            const randomIdx = Math.floor(Math.random() * state.sorteioIndividual.pool.length);
+            els.rouletteDisplay.textContent = state.sorteioIndividual.pool[randomIdx].nome;
 
             elapsed += intervalTime;
 
@@ -1934,12 +2614,21 @@ window.profAPI = {
                 clearInterval(interval);
 
                 // Escolhe o Vencedor Final
-                const winnerIdx = Math.floor(Math.random() * students.length);
-                const winner = students[winnerIdx];
+                const winnerIdx = Math.floor(Math.random() * state.sorteioIndividual.pool.length);
+                const winner = state.sorteioIndividual.pool[winnerIdx];
 
                 els.rouletteDisplay.textContent = winner.nome;
                 els.rouletteDisplay.classList.add('roulette-winner');
                 els.btnSpinIndiv.disabled = false;
+
+                state.sorteioIndividual.winner = { id: winner.id, nome: winner.nome };
+                state.sorteioIndividual.sorteados.push(winner);
+                state.sorteioIndividual.pool.splice(winnerIdx, 1);
+
+                if (els.btnResetSorteio) els.btnResetSorteio.classList.remove('hidden');
+                if (state.sorteioIndividual.pool.length === 0) {
+                    els.btnSpinIndiv.disabled = true;
+                }
 
                 // Efeito de Confete!
                 if (window.confetti) {
@@ -1996,28 +2685,15 @@ window.profAPI = {
         els.btnExportTxt.classList.remove('hidden');
     },
 
-    exportGroupsTxt: () => {
-        if (sortedGroupsCache.length === 0) return;
-
-        const { school, classId } = state.filters;
-        let content = `ESCOLA: ${school}\nTURMA: ${classId}\nDATA: ${new Date().toLocaleDateString('pt-BR')}\n\n`;
-        content += "=== EQUIPES SORTEADAS ===\n\n";
-
-        sortedGroupsCache.forEach((group, idx) => {
-            content += `[ EQUIPE ${idx + 1} ]\n`;
-            group.forEach(st => content += `- ${st.nome}\n`);
-            content += "\n";
-        });
-
-        // Cria o arquivo de texto na memória do navegador e força o download
-        const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = `Equipes_${classId}.txt`;
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
+    resetSorteioIndividual: () => {
+        if (!state.cache.students.length) return;
+        state.sorteioIndividual.pool = state.cache.students.map(s => ({ id: s.id, nome: s.nome }));
+        state.sorteioIndividual.sorteados = [];
+        state.sorteioIndividual.winner = null;
+        els.rouletteDisplay.classList.remove('roulette-winner');
+        els.rouletteDisplay.innerHTML = '<span class="text-2xl opacity-50">Pronto para sortear</span>';
+        els.btnSpinIndiv.disabled = false;
+        if (els.btnResetSorteio) els.btnResetSorteio.classList.add('hidden');
     },
 
     // ==========================================
@@ -2590,6 +3266,226 @@ window.profAPI = {
         };
 
         chartInstances[id] = new Chart(ctx, config);
+    },
+
+    // ==========================================
+    // MÓDULO: EVOLUÇÃO DO ALUNO (NOTAS + FREQUÊNCIA)
+    // ==========================================
+    initEvolucaoTab: () => {
+        const list = state.cache.students;
+        const anterior = els.evolAluno.value;
+
+        els.evolAluno.innerHTML = '<option value="">Selecione...</option>';
+        list.forEach(s => els.evolAluno.add(new Option(s.nome, s.id)));
+        if (anterior && list.some(s => s.id === anterior)) els.evolAluno.value = anterior;
+
+        els.evolTrimestre.value = state.filters.quarter || '1';
+        if (!els.evolStart.value || !els.evolEnd.value) window.profAPI.resetEvolucaoPeriodo(false);
+
+        els.evolMsg.textContent = list.length
+            ? 'Selecione um aluno acima e clique em Analisar.'
+            : 'Carregue a turma no menu superior primeiro.';
+    },
+
+    resetEvolucaoPeriodo: (reRender = true) => {
+        const fim = new Date();
+        const ini = new Date();
+        ini.setDate(ini.getDate() - 90);
+        els.evolStart.value = dataParaInput(ini);
+        els.evolEnd.value = dataParaInput(fim);
+        if (reRender && state.evolucaoAluno.dados) window.profAPI.renderEvolucaoFaltas();
+    },
+
+    loadEvolucaoAluno: async () => {
+        const uid = els.evolAluno.value;
+        if (!uid) return alert('Selecione um aluno.');
+        const { classId } = state.filters;
+        if (!classId) return alert('Selecione a turma no menu superior.');
+
+        els.evolMsg.innerHTML = '<i class="fas fa-spinner fa-spin mr-2 text-emerald-400"></i> Montando dossiê de evolução...';
+        els.evolDashboard.classList.add('hidden');
+        els.evolMsg.classList.remove('hidden');
+
+        try {
+            const [notasSnap, presSnap] = await Promise.all([
+                getDoc(doc(db, "notas", uid)),
+                getDocs(query(collection(db, "presencas"), where("turma", "==", classId)))
+            ]);
+
+            const trimestre = String(els.evolTrimestre.value || '1');
+            const nome = els.evolAluno.options[els.evolAluno.selectedIndex]?.text || 'Aluno';
+            const notasRaw = notasSnap.exists() ? (notasSnap.data().disciplinasComNotas || {}) : {};
+
+            // --- Notas do trimestre selecionado, por disciplina ---
+            const porDisciplina = Object.entries(notasRaw).map(([discId, trimestres]) => {
+                const t = (trimestres || {})[trimestre] || {};
+                const brutos = [t.nota1, t.nota2, t.nota3, t.nota4];
+                const vals = brutos
+                    .map(v => (v === null || v === undefined || v === '' ? null : parseFloat(v)))
+                    .filter(v => Number.isFinite(v));
+                return {
+                    discId,
+                    nome: state.cache.disciplinesMap.get(discId) || discId,
+                    brutos,
+                    vals,
+                    media: vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : null
+                };
+            }).sort((a, b) => (b.media ?? -1) - (a.media ?? -1));
+
+            // --- Aulas do aluno (todas as disciplinas da turma) ---
+            const aulas = [];
+            presSnap.forEach(d => {
+                const data = d.data();
+                const status = normalizarStatusPresenca(data.registros ? data.registros[uid] : null);
+                if (status === 'sem-registro') return;
+                const ts = data.data_aula_timestamp;
+                const dateObj = ts ? (typeof ts.toDate === 'function' ? ts.toDate() : new Date(ts)) : null;
+                aulas.push({ date: dateObj, status, discId: data.disciplineId || data.disciplinaId });
+            });
+            aulas.sort((a, b) => (a.date ? a.date.getTime() : 0) - (b.date ? b.date.getTime() : 0));
+
+            state.evolucaoAluno = {
+                ...state.evolucaoAluno,
+                alunoId: uid,
+                alunoNome: nome,
+                trimestre,
+                dados: { porDisciplina, aulas }
+            };
+
+            window.profAPI.renderEvolucao();
+
+        } catch (e) {
+            console.error(e);
+            els.evolMsg.innerHTML = `<span class="text-red-400 font-bold">Erro ao carregar: ${escapeHTML(e.message)}</span>`;
+        }
+    },
+
+    renderEvolucao: () => {
+        const { porDisciplina } = state.evolucaoAluno.dados;
+
+        // Achata todas as notas do trimestre, mantendo a ordem N1..N4
+        const itens = [];
+        porDisciplina.forEach(d => {
+            d.brutos.forEach((b, i) => {
+                const v = (b === null || b === undefined || b === '') ? null : parseFloat(b);
+                if (Number.isFinite(v)) itens.push({ pos: i, rotulo: `N${i + 1}`, nota: v, disciplina: d.nome });
+            });
+        });
+
+        const stats = estatisticasNotas(itens.map(i => i.nota));
+
+        // Progressão = reta de tendência sobre a MÉDIA de cada posição (N1..N4).
+        // Usar as notas achatadas daria um resultado distorcido, porque a ordem
+        // seria por disciplina e não ao longo do trimestre.
+        const mediasPos = [0, 1, 2, 3].map(pos => {
+            const vals = itens.filter(i => i.pos === pos).map(i => i.nota);
+            return vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : null;
+        });
+        const progStats = estatisticasNotas(mediasPos.filter(v => v !== null));
+
+        // Revela o painel ANTES de criar os gráficos: o Chart.js precisa que o
+        // canvas já tenha largura para não renderizar em 0x0.
+        els.evolMsg.classList.add('hidden');
+        els.evolDashboard.classList.remove('hidden');
+        els.evolDashboard.classList.add('flex');
+
+        renderEvolucaoKpis(stats, progStats, porDisciplina);
+        renderEvolucaoProgressao(mediasPos, stats); // Progressão das notas
+        renderEvolucaoDispersao(itens, stats);    // Dispersão
+        renderEvolucaoDisciplinas(porDisciplina); // Média por disciplina
+        renderEvolucaoTabela(porDisciplina);      // Tabela N1..N4
+        window.profAPI.renderEvolucaoFaltas();     // Frequência no período
+    },
+
+    renderEvolucaoFaltas: () => {
+        const dados = state.evolucaoAluno.dados;
+        if (!dados) return;
+
+        const startStr = els.evolStart.value;
+        const endStr = els.evolEnd.value;
+        const inicio = startStr ? new Date(startStr + 'T00:00:00').getTime() : 0;
+        const fim = endStr ? new Date(endStr + 'T23:59:59').getTime() : Infinity;
+
+        const noPeriodo = dados.aulas.filter(a => {
+            const t = a.date ? a.date.getTime() : NaN;
+            return !Number.isNaN(t) && t >= inicio && t <= fim;
+        });
+
+        const analise = analisarAusentismo(noPeriodo.map(a => ({ status: a.status, date: a.date })));
+
+        // Agrupa por data (aulas do mesmo dia viram uma coluna)
+        const porDia = new Map();
+        noPeriodo.forEach(a => {
+            if (!a.date) return;
+            const k = a.date.toISOString().slice(0, 10);
+            if (!porDia.has(k)) porDia.set(k, { p: 0, f: 0, j: 0 });
+            const g = porDia.get(k);
+            if (a.status === 'presente') g.p++;
+            else if (a.status === 'ausente') g.f++;
+            else if (a.status === 'justificado') g.j++;
+        });
+        const dias = [...porDia.keys()].sort();
+        const labels = dias.map(d => d.slice(8, 10) + '/' + d.slice(5, 7));
+
+        // Atualiza o KPI de frequência do período
+        const kpiFreq = document.getElementById('evol-kpi-freq');
+        if (kpiFreq) {
+            const pct = analise.pctPresenca.toFixed(1) + '%';
+            kpiFreq.textContent = analise.registradas ? pct : '-';
+            kpiFreq.className = 'text-3xl font-black ' + (analise.registradas ? corPctPresenca(analise.pctPresenca) : 'text-slate-500');
+        }
+        const kpiFreqSub = document.getElementById('evol-kpi-freq-sub');
+        if (kpiFreqSub) kpiFreqSub.textContent = analise.registradas ? `${analise.total} faltas em ${analise.registradas} aulas` : 'sem aulas no período';
+
+        // Alertas de absenteísmo do período escolhido
+        const box = els.evolAlertas;
+        if (analise.critico) {
+            box.innerHTML = `<div class="bg-red-500/10 border border-red-500/30 rounded-2xl p-5 flex flex-wrap items-center gap-4">
+                <div class="w-11 h-11 rounded-xl bg-red-500/20 text-red-400 flex items-center justify-center shrink-0"><i class="fas fa-triangle-exclamation text-lg"></i></div>
+                <div class="flex-1 min-w-[200px]">
+                    <div class="text-red-400 font-black uppercase tracking-widest text-xs">Alerta de absenteísmo no período selecionado</div>
+                    <div class="text-slate-400 text-[11px] mt-1">${startStr || 'início'} até ${endStr || 'fim'} · ${analise.total} faltas em ${analise.registradas} aulas</div>
+                </div>
+                <div class="flex flex-wrap gap-1">${renderAlertasAusentismo(analise)}</div>
+            </div>`;
+        } else {
+            box.innerHTML = '';
+        }
+
+        const canvas = document.getElementById('evol-chart-faltas');
+        const msg = document.getElementById('evol-chart-faltas-msg');
+        if (!canvas) return;
+
+        if (chartInstances['evolFaltas']) chartInstances['evolFaltas'].destroy();
+        if (labels.length === 0) {
+            if (msg) { msg.textContent = 'Nenhuma aula no período selecionado.'; msg.classList.remove('hidden'); }
+            return;
+        }
+        if (msg) msg.classList.add('hidden');
+
+        chartInstances['evolFaltas'] = new Chart(canvas.getContext('2d'), {
+            type: 'bar',
+            data: {
+                labels,
+                datasets: [
+                    { label: 'Presente', data: dias.map(d => porDia.get(d).p), backgroundColor: '#22c55e', borderRadius: 2 },
+                    { label: 'Falta', data: dias.map(d => porDia.get(d).f), backgroundColor: '#ef4444', borderRadius: 2 },
+                    { label: 'Justificado', data: dias.map(d => porDia.get(d).j), backgroundColor: '#3b82f6', borderRadius: 2 }
+                ]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: {
+                    legend: { labels: { color: '#cbd5e1', boxWidth: 12, font: { size: 10 } } },
+                    tooltip: { mode: 'index', intersect: false }
+                },
+                scales: {
+                    x: { stacked: true, ticks: { color: '#64748b', font: { size: 8 }, autoSkip: true, maxRotation: 0 }, grid: { display: false } },
+                    y: { stacked: true, beginAtZero: true, ticks: { color: '#64748b', precision: 0 }, grid: { color: '#334155' } }
+                }
+            }
+        });
     },
 
     runPredictiveAnalysis: () => {
